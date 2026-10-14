@@ -8,13 +8,15 @@
 # go.mod/go.sum are Bifrost transports/v2.3.0's own, so every shared module resolves to the
 # version linked into the host binary.
 #
-# Usage: ./build.sh [version]   (artifacts land in dist/)
+# Usage: ./build.sh <plugin> [version]   e.g. ./build.sh api-key-mapper v0.1.0
+#        (builds ./plugins/<plugin>; artifacts land in dist/)
 set -euo pipefail
 
-VERSION="${1:-v0.1.0}"
-NAME="joke-header"
+NAME="${1:?usage: ./build.sh <plugin> [version]; plugins: $(ls "$(dirname "$0")/plugins" | tr '\n' ' ')}"
+VERSION="${2:-v0.1.0}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DIST="$ROOT/dist"
+[ -d "$ROOT/plugins/$NAME" ] || { echo "no such plugin: plugins/$NAME" >&2; exit 1; }
 
 MUSL_IMAGE="golang:1.27.0-alpine3.24@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc"
 GLIBC_IMAGE="golang:1.27.0-bookworm@sha256:ded31c68586d2e49e760acc2e65a884b23d032e9bbbed0ae0c55abd3fcaf4452"
@@ -45,7 +47,7 @@ for target in "${TARGETS[@]}"; do
     "$image" \
     sh -c "$deps && go build -buildmode=plugin -trimpath \
              -ldflags='-X main.Version=$VERSION' \
-             -o /dist/$out . && go version -m /dist/$out | head -3"
+             -o /dist/$out ./plugins/$NAME && go version -m /dist/$out | head -3"
 done
 
-(cd "$DIST" && shasum -a 256 ./*.so | sed 's# \./# #' > SHA256SUMS && cat SHA256SUMS)
+(cd "$DIST" && shasum -a 256 ./"$NAME"-*.so | sed 's# \./# #' > "$NAME-SHA256SUMS" && cat "$NAME-SHA256SUMS")
