@@ -107,6 +107,35 @@ func TestMapsOtherKeyHeaders(t *testing.T) {
 	}
 }
 
+func TestMapsBareAuthorizationKey(t *testing.T) {
+	srv, _ := fakeMappingService(t, 0)
+	m := testMapper(t, srv.URL, nil)
+	req := request(map[string]string{"Authorization": legacyKey})
+	m.translate(nil, req)
+	if got := req.Headers["Authorization"]; got != "Bearer "+mappedVK {
+		t.Fatalf("Authorization = %q", got)
+	}
+}
+
+func TestRetriesOnceWhenConnectionDrops(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			// What a keep-alive connection the server just closed looks like: no response.
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"bifrostVirtualKeyId":"` + mappedVKID + `","bifrostVirtualKeyValue":"` + mappedVK + `"}`))
+	}))
+	t.Cleanup(srv.Close)
+	m := testMapper(t, srv.URL, nil)
+	if res := m.resolve(legacyKey); res.status != statusMapped || calls.Load() != 2 {
+		t.Fatalf("status = %q after %d calls, want mapped after 2", res.status, calls.Load())
+	}
+}
+
 func TestLeavesBifrostCredentialsAlone(t *testing.T) {
 	srv, calls := fakeMappingService(t, 0)
 	m := testMapper(t, srv.URL, nil)
@@ -210,6 +239,29 @@ func TestResponseHeaderHook(t *testing.T) {
 	}
 	if resp.Header(statusHeader) != statusMapped {
 		t.Fatalf("response headers = %v", resp.Headers)
+	}
+}
+
+// Bifrost reloads a plugin by running the new instance's Init, then the old
+// instance's Cleanup; a .so reopened from the same file shares one Init/Cleanup.
+func TestReloadOrderKeepsNewConfig(t *testing.T) {
+	srv, _ := fakeMappingService(t, 0)
+	t.Cleanup(func() { active.Store(nil) })
+	if err := Init(map[string]any{"mapping_url": "http://old-mapping:8080"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Init(map[string]any{"mapping_url": srv.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	req := request(map[string]string{"Authorization": "Bearer " + legacyKey})
+	if _, err := HTTPTransportPreAuthHook(nil, req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Headers[virtualKeyHeader] != mappedVK {
+		t.Fatalf("not mapped after reload: %v", req.Headers)
 	}
 }
 

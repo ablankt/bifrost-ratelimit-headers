@@ -5,7 +5,7 @@ Custom [Bifrost](https://github.com/maximhq/bifrost) plugins, built for **Bifros
 
 | Plugin | What it does | Latest release |
 |---|---|---|
-| [`api-key-mapper`](#api-key-mapper) | Accepts API keys issued for the previous gateway by swapping in the Bifrost virtual key they map to | `api-key-mapper-v0.1.0` |
+| [`api-key-mapper`](#api-key-mapper) | Accepts API keys issued for the previous gateway by swapping in the Bifrost virtual key they map to | `api-key-mapper-v0.1.1` |
 | [`joke-header`](#joke-header) | Smoke test: adds `x-joke-header` to every inference response | `v0.1.0` |
 
 Every release ships four builds. Use the one that matches your Bifrost binary:
@@ -42,7 +42,8 @@ POST {mapping_url}/v1/api-key-mappings/resolve     {"apiKey": "<presented key>"}
   any header, any `x-bf-vk` header, and user tokens (JWTs).
 
 The plugin reads the key from the same headers Bifrost reads virtual keys from:
-`Authorization: Bearer …`, `x-api-key`, `api-key` and `x-goog-api-key`.
+`Authorization: Bearer …`, `x-api-key`, `api-key` and `x-goog-api-key`. It also accepts a bare
+`Authorization: <key>` with no scheme, and rewrites it to Bearer form.
 
 ### Configure
 
@@ -50,7 +51,7 @@ The plugin reads the key from the same headers Bifrost reads virtual keys from:
 {
   "enabled": true,
   "name": "api-key-mapper",
-  "path": "https://github.com/ablankt/bifrost-ratelimit-headers/releases/download/api-key-mapper-v0.1.0/api-key-mapper-linux-amd64-musl.so",
+  "path": "https://github.com/ablankt/bifrost-ratelimit-headers/releases/download/api-key-mapper-v0.1.1/api-key-mapper-linux-amd64-musl.so",
   "config": {
     "mapping_url": "http://<mapping-service>.<namespace>.svc.cluster.local:8080"
   }
@@ -70,8 +71,23 @@ The plugin reads the key from the same headers Bifrost reads virtual keys from:
 | `skip_prefixes` | `["sk-bf-"]` | Keys starting with any of these are treated as Bifrost credentials and never looked up. |
 | `status_header` | `true` | Add `x-key-mapping: mapped` to the responses of mapped requests. |
 
-The plugin connects to the mapping service directly and ignores `HTTP(S)_PROXY`. It never logs key
-material. Lookup failures are printed at most once every 30s.
+The plugin connects to the mapping service directly and ignores `HTTP(S)_PROXY`. Idle connections
+are dropped after 4s, before uvicorn's 5s keep-alive closes them, and a lookup whose connection
+fails is retried once. It never logs key material. Lookup failures are printed at most once every
+30s.
+
+### Adding it or changing its config: restart Bifrost
+
+When `path` is a URL, Bifrost downloads a fresh copy of the `.so` every time the plugin is saved,
+but Go cannot load the same plugin twice into one process. Every pod that already loaded it
+(even a load whose `Init` failed, for example because the plugin was added before its config was
+filled in) then logs `plugin.Open(...): plugin already loaded` and keeps running without the
+plugin. **After adding the plugin, changing its config or switching its URL, restart the Bifrost
+pods** (`kubectl -n <ns> rollout restart deploy/<bifrost>`). At startup they load it once with the
+saved config.
+
+With a local file path instead of a URL (for example a `.so` placed by an init container), a save
+reopens the same file, and Bifrost re-runs `Init` with the new config without a restart.
 
 ### Try it
 
@@ -97,9 +113,14 @@ The arm64 musl build was tested in a dynamically linked Bifrost v2.3.0 with
 | Unknown key, unknown key again, or a spoofed `x-key-mapping-status` request header | 401, with one lookup across all three |
 | Bifrost virtual key, or no credential | not looked up; normal Bifrost behaviour |
 | Mapping service down | 401 in ~0.1s, with a warning in the Bifrost log |
+| Config changed through `PUT /api/plugins/...`, `.so` loaded from a local path | new config applied without a restart |
 
-Unit tests (`go test -race ./plugins/...`) cover the same cases, plus the wrong-path guard and
-concurrent lookups.
+Unit tests (`go test -race ./plugins/...`) cover the same cases, plus the wrong-path guard, concurrent
+lookups, a dropped connection being retried, a bare `Authorization` key, and Bifrost's reload order
+(new `Init`, then old `Cleanup`).
+
+In the enterprise v2.3.0 dev deployment, the amd64 musl build mapped a real legacy key on every pod
+that loaded it.
 
 ---
 

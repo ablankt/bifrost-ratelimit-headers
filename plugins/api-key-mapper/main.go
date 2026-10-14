@@ -112,9 +112,13 @@ func HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, req *schemas.
 	return nil
 }
 
-// Cleanup is required by the Bifrost plugin loader.
+// Cleanup is required by the Bifrost plugin loader. It deliberately keeps the
+// mapper: when Bifrost reloads the plugin from the same file, both loads share
+// this package's state, and the old instance's Cleanup runs after the new
+// instance's Init. A removed plugin's hooks are no longer called, so keeping it
+// costs nothing.
 func Cleanup() error {
-	if m := active.Swap(nil); m != nil {
+	if m := active.Load(); m != nil {
 		m.close()
 	}
 	return nil
@@ -186,7 +190,9 @@ func newMapper(config any) (*mapper, error) {
 				DialContext:         (&net.Dialer{Timeout: timeout}).DialContext,
 				MaxIdleConns:        maxLookups,
 				MaxIdleConnsPerHost: maxLookups,
-				IdleConnTimeout:     90 * time.Second,
+				// Below uvicorn's 5s keep-alive, so a pooled connection is dropped
+				// here before the mapping service closes it under a request.
+				IdleConnTimeout: 4 * time.Second,
 			},
 		},
 		skipPrefixes: skipPrefixes,
@@ -252,10 +258,16 @@ func (m *mapper) presentedKey(req *schemas.HTTPRequest) (header, key string, ok 
 		}
 		value = strings.TrimSpace(value)
 		if want == "authorization" {
-			if len(value) < 7 || !strings.EqualFold(value[:7], "bearer ") {
+			scheme, token, hasScheme := strings.Cut(value, " ")
+			switch {
+			case hasScheme && strings.EqualFold(scheme, "bearer"):
+				value = strings.TrimSpace(token)
+			case hasScheme:
 				continue // Basic auth and other schemes are not API keys
+			default:
+				// A bare key with no scheme, as some clients of the previous gateway
+				// send it. Bifrost would refuse it, so it is translated to Bearer form.
 			}
-			value = strings.TrimSpace(value[7:])
 		}
 		if value == "" {
 			continue
@@ -330,15 +342,24 @@ func (m *mapper) lookup(key string) resolution {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), m.client.Timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.resolveURL, bytes.NewReader(body))
-	if err != nil {
-		return resolution{status: statusUnavailable}
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
 
-	resp, err := m.client.Do(req)
-	if err != nil {
+	var resp *http.Response
+	for attempt := 1; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.resolveURL, bytes.NewReader(body))
+		if err != nil {
+			return resolution{status: statusUnavailable}
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		if resp, err = m.client.Do(req); err == nil {
+			break
+		}
+		// net/http never retries a POST itself, so a pooled connection the service
+		// closed a moment ago would fail the lookup. Resolving is read-only: retry
+		// once, on a fresh connection.
+		if attempt == 1 && ctx.Err() == nil {
+			continue
+		}
 		m.warn("mapping service unreachable: %v", err)
 		return resolution{status: statusUnavailable}
 	}
