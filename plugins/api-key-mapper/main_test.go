@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -93,6 +95,9 @@ func TestMapsBearerKey(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("mapping service called %d times, want 1", calls.Load())
 	}
+	if res := m.resolve(legacyKey); !res.cached {
+		t.Fatalf("repeat lookup not reported as cached")
+	}
 }
 
 func TestMapsOtherKeyHeaders(t *testing.T) {
@@ -178,9 +183,9 @@ func TestUnknownKeyPassesThroughAndIsNegativelyCached(t *testing.T) {
 func TestClientMarkerIsBlanked(t *testing.T) {
 	srv, _ := fakeMappingService(t, 0)
 	m := testMapper(t, srv.URL, nil)
-	req := request(map[string]string{"Authorization": "Bearer unknown-key", "X-Key-Mapping-Status": statusMapped})
+	req := request(map[string]string{"Authorization": "Bearer unknown-key", "X-Key-Mapping-Status": statusMapped, "X-Key-Mapping-Latency": "0.1"})
 	m.translate(nil, req)
-	if req.CaseInsensitiveHeaderLookup(markerHeader) != "" {
+	if req.CaseInsensitiveHeaderLookup(markerHeader) != "" || req.CaseInsensitiveHeaderLookup(latencyMarkerHeader) != "" {
 		t.Fatalf("spoofed marker survived: %v", req.Headers)
 	}
 }
@@ -239,6 +244,10 @@ func TestResponseHeaderHook(t *testing.T) {
 	}
 	if resp.Header(statusHeader) != statusMapped {
 		t.Fatalf("response headers = %v", resp.Headers)
+	}
+	latency := resp.Header(latencyHeader)
+	if ms, err := strconv.ParseFloat(strings.TrimSuffix(latency, "ms"), 64); err != nil || !strings.HasSuffix(latency, "ms") || ms < 0 {
+		t.Fatalf("x-lookup-latency = %q", latency)
 	}
 }
 

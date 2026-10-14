@@ -5,7 +5,7 @@ Custom [Bifrost](https://github.com/maximhq/bifrost) plugins, built for **Bifros
 
 | Plugin | What it does | Latest release |
 |---|---|---|
-| [`api-key-mapper`](#api-key-mapper) | Accepts API keys issued for the previous gateway by swapping in the Bifrost virtual key they map to | `api-key-mapper-v0.1.1` |
+| [`api-key-mapper`](#api-key-mapper) | Accepts API keys issued for the previous gateway by swapping in the Bifrost virtual key they map to | `api-key-mapper-v0.1.2` |
 | [`joke-header`](#joke-header) | Smoke test: adds `x-joke-header` to every inference response | `v0.1.0` |
 
 Every release ships four builds. Use the one that matches your Bifrost binary:
@@ -35,7 +35,10 @@ POST {mapping_url}/v1/api-key-mappings/resolve     {"apiKey": "<presented key>"}
 
 * **Mapped:** the virtual key replaces the old key in the header it arrived in, and is also set as
   `x-bf-vk`. Bifrost then authenticates, governs and logs the request as that virtual key, and the
-  old key is never forwarded to a provider. The response carries `x-key-mapping: mapped`.
+  old key is never forwarded to a provider. The response carries `x-key-mapping: mapped` and
+  `x-lookup-latency: <n>ms`, the time the lookup added to the request (about `0.0ms` once the key
+  is cached). The request's plugin log reads
+  `legacy API key mapped to virtual key <id> in <n> ms`, ending in `(cached)` for a cache hit.
 * **Unknown key, mapping service down, or misconfigured:** the request goes on unchanged and
   Bifrost's own authentication decides. An unknown key still gets the normal 401.
 * **Already a Bifrost credential:** the plugin does not look it up. This covers an `sk-bf-…` key in
@@ -51,7 +54,7 @@ The plugin reads the key from the same headers Bifrost reads virtual keys from:
 {
   "enabled": true,
   "name": "api-key-mapper",
-  "path": "https://github.com/ablankt/bifrost-ratelimit-headers/releases/download/api-key-mapper-v0.1.1/api-key-mapper-linux-amd64-musl.so",
+  "path": "https://github.com/ablankt/bifrost-ratelimit-headers/releases/download/api-key-mapper-v0.1.2/api-key-mapper-linux-amd64-musl.so",
   "config": {
     "mapping_url": "http://<mapping-service>.<namespace>.svc.cluster.local:8080"
   }
@@ -69,7 +72,7 @@ The plugin reads the key from the same headers Bifrost reads virtual keys from:
 | `cache_max_entries` | `10000` | Cache bound. Entries are keyed by the SHA-256 of the key, so raw legacy keys are never held in memory. |
 | `max_concurrent_lookups` | `64` | Concurrent lookups allowed against the mapping service. Concurrent requests with the same key share one lookup. |
 | `skip_prefixes` | `["sk-bf-"]` | Keys starting with any of these are treated as Bifrost credentials and never looked up. |
-| `status_header` | `true` | Add `x-key-mapping: mapped` to the responses of mapped requests. |
+| `status_header` | `true` | Add `x-key-mapping: mapped` and `x-lookup-latency` to the responses of mapped requests. |
 
 The plugin connects to the mapping service directly and ignores `HTTP(S)_PROXY`. Idle connections
 are dropped after 4s, before uvicorn's 5s keep-alive closes them, and a lookup whose connection
@@ -82,9 +85,17 @@ When `path` is a URL, Bifrost downloads a fresh copy of the `.so` every time the
 but Go cannot load the same plugin twice into one process. Every pod that already loaded it
 (even a load whose `Init` failed, for example because the plugin was added before its config was
 filled in) then logs `plugin.Open(...): plugin already loaded` and keeps running without the
-plugin. **After adding the plugin, changing its config or switching its URL, restart the Bifrost
-pods** (`kubectl -n <ns> rollout restart deploy/<bifrost>`). At startup they load it once with the
-saved config.
+plugin. Bifrost then rolls the saved row back, and deletes it if the failed save created it, so
+the change is not kept either.
+
+So with a URL:
+
+* **First install:** add the plugin with its URL *and* config in a single save, on pods that have
+  never loaded it.
+* **Config change or new version:** delete the plugin, restart the Bifrost pods
+  (`kubectl -n <ns> rollout restart deploy/<bifrost>`), then add it again with the new URL and
+  config in a single save. Every version shares one Go plugin path, so a new version also counts
+  as "already loaded" in a process that ran an old one.
 
 With a local file path instead of a URL (for example a `.so` placed by an init container), a save
 reopens the same file, and Bifrost re-runs `Init` with the new config without a restart.

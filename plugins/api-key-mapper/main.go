@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,7 @@ const (
 
 	virtualKeyHeader = "x-bf-vk"
 	statusHeader     = "x-key-mapping"
+	latencyHeader    = "x-lookup-latency"
 
 	defaultResolvePath = "/v1/api-key-mappings/resolve"
 	maxResponseBytes   = 64 << 10
@@ -48,10 +50,13 @@ const (
 // Version is stamped by build.sh through -ldflags "-X main.Version=...".
 var Version = "dev"
 
-// markerHeader carries a successful mapping from the pre-auth hook to the
-// response-headers hook as a request header: the two hooks get different
-// BifrostContexts, but both see the request's headers.
-const markerHeader = "x-key-mapping-status"
+// The marker headers carry a successful mapping and the time its lookup took
+// from the pre-auth hook to the response-headers hook as request headers: the
+// two hooks get different BifrostContexts, but both see the request's headers.
+const (
+	markerHeader        = "x-key-mapping-status"
+	latencyMarkerHeader = "x-key-mapping-latency"
+)
 
 // Lookup outcomes, also the values of the x-key-mapping response header.
 const (
@@ -99,8 +104,9 @@ func HTTPTransportPreAuthHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequ
 }
 
 // HTTPTransportResponseHeadersHook reports a successful mapping in the
-// x-key-mapping response header. Bifrost skips this hook for requests its
-// authentication refuses, so there is no header for unknown keys.
+// x-key-mapping response header, and the time the lookup added to the request
+// in x-lookup-latency. Bifrost skips this hook for requests its authentication
+// refuses, so there are no headers for unknown keys.
 func HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error {
 	m := active.Load()
 	if m == nil || !m.statusHeader || req == nil {
@@ -108,6 +114,9 @@ func HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, req *schemas.
 	}
 	if req.CaseInsensitiveHeaderLookup(markerHeader) == statusMapped {
 		resp.SetHeader(statusHeader, statusMapped)
+		if latency := req.CaseInsensitiveHeaderLookup(latencyMarkerHeader); latency != "" {
+			resp.SetHeader(latencyHeader, latency+"ms")
+		}
 	}
 	return nil
 }
@@ -216,8 +225,10 @@ func (m *mapper) translate(ctx *schemas.BifrostContext, req *schemas.HTTPRequest
 	}
 	// A client-sent marker must not claim a mapping that never happened. The
 	// transport only writes headers back, never deletes them, so blank it.
-	if name, _ := lookupHeader(req.Headers, markerHeader); name != "" {
-		req.Headers[name] = ""
+	for _, marker := range []string{markerHeader, latencyMarkerHeader} {
+		if name, _ := lookupHeader(req.Headers, marker); name != "" {
+			req.Headers[name] = ""
+		}
 	}
 	if req.CaseInsensitiveHeaderLookup(virtualKeyHeader) != "" {
 		return // the caller already names its virtual key explicitly
@@ -227,12 +238,18 @@ func (m *mapper) translate(ctx *schemas.BifrostContext, req *schemas.HTTPRequest
 		return
 	}
 
+	start := time.Now()
 	res := m.resolve(key)
+	latency := strconv.FormatFloat(float64(time.Since(start).Microseconds())/1000, 'f', 1, 64)
 	if res.status != statusMapped {
 		return
 	}
 	if ctx != nil {
-		ctx.Log(schemas.LogLevelInfo, "legacy API key mapped to virtual key "+res.virtualKeyID)
+		msg := "legacy API key mapped to virtual key " + res.virtualKeyID + " in " + latency + " ms"
+		if res.cached {
+			msg += " (cached)"
+		}
+		ctx.Log(schemas.LogLevelInfo, msg)
 	}
 
 	if strings.EqualFold(header, "authorization") {
@@ -244,6 +261,7 @@ func (m *mapper) translate(ctx *schemas.BifrostContext, req *schemas.HTTPRequest
 	// with the sk-bf- prefix, so set it too.
 	req.Headers[virtualKeyHeader] = res.virtualKey
 	setHeader(req.Headers, markerHeader, statusMapped)
+	setHeader(req.Headers, latencyMarkerHeader, latency)
 }
 
 // presentedKey returns the header carrying a key worth looking up, under the
@@ -299,6 +317,7 @@ type resolution struct {
 	status       string
 	virtualKey   string
 	virtualKeyID string
+	cached       bool // answered from the cache rather than the mapping service
 }
 
 // resolve answers from the cache, or asks the mapping service once on behalf
@@ -307,10 +326,12 @@ type resolution struct {
 func (m *mapper) resolve(key string) resolution {
 	digest := sha256.Sum256([]byte(key))
 	if res, ok := m.cache.get(digest); ok {
+		res.cached = true
 		return res
 	}
 	return m.inflight.do(digest, func() resolution {
 		if res, ok := m.cache.get(digest); ok {
+			res.cached = true
 			return res
 		}
 		select {
