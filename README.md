@@ -78,7 +78,12 @@ TARGETS="amd64/musl" ./build.sh       # just one
 
 ## Tested
 
-Both arm64 variants were loaded into dynamically linked Bifrost v2.3.0 hosts built from the
-`transports/v2.3.0` tag with the docs' Option A (Alpine/musl) and Option B (Debian/glibc) recipes.
-The header was present on non-streaming, streaming, `/v1/models` and error responses. The amd64
-variants come from the same pinned toolchain and flags.
+Each test host was a dynamically linked Bifrost v2.3.0 built from the `transports/v2.3.0` tag with
+the docs' Option A (Alpine/musl) or Option B (Debian/glibc) recipe:
+
+| Variant | Loaded from | Result |
+|---|---|---|
+| arm64 musl | local path and this release's URL | active; header present on non-streaming, streaming, `/v1/models` and error responses |
+| arm64 glibc | local path | active; same |
+| amd64 musl | this release's URL | active; header present |
+| amd64 glibc | not load-tested | built with the same pinned toolchain and flags |
