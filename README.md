@@ -6,6 +6,7 @@ Custom [Bifrost](https://github.com/maximhq/bifrost) plugins, built for **Bifros
 | Plugin | What it does | Latest release |
 |---|---|---|
 | [`api-key-mapper`](#api-key-mapper) | Accepts API keys issued for the previous gateway by swapping in the Bifrost virtual key they map to | `api-key-mapper-v0.1.2` |
+| [`response-blacklist`](#response-blacklist) | Removes and renames response headers and JSON body entries (streamed too) so gateway internals do not reach customers, with rules from a GO Feature Flag flag | `response-blacklist-v0.1.0` |
 | [`joke-header`](#joke-header) | Smoke test: adds `x-joke-header` to every inference response | `v0.1.0` |
 
 Every release ships four builds. Use the one that matches your Bifrost binary:
@@ -132,6 +133,110 @@ lookups, a dropped connection being retried, a bare `Authorization` key, and Bif
 
 In the enterprise v2.3.0 dev deployment, the amd64 musl build mapped a real legacy key on every pod
 that loaded it.
+
+---
+
+## response-blacklist
+
+Keeps gateway internals out of what customers receive. It removes and renames response headers, and
+removes or renames entries of JSON response bodies, in normal and streamed responses alike, on
+every inference route (`/v1/...`, `/openai/...`, ...).
+
+The rules come from a [GO Feature Flag](https://gofeatureflag.org) flag, evaluated through the relay
+proxy every `refresh_seconds`, so changing them needs no Bifrost restart. While the flag serves no
+rules (it is disabled or missing), the plugin applies the `rules` in its own config. While the
+relay cannot answer, or serves rules the plugin refuses, it keeps the rules it applied before.
+
+```yaml
+blacklist-bifrost:               # the flag; every variation is a rule set
+  variations:
+    enforced:
+      headers:
+        remove:                  # regexes the whole header name must match, any case
+          - x-bifrost-routing-info-key
+        rename:                  # in order, on the lower-cased names that are left
+          - pattern: '(?i)bifrost'      # x-bifrost-trace-id -> x-backend-trace-id
+            replacement: backend
+            target: both                # names (default), values or both
+      body:
+        remove:                  # JSON paths, whatever their value; * = any key, arrays are walked
+          - extra_fields.provider
+          - extra_fields.provider_response_headers
+          - prompt_filter_results
+        rename:
+          - pattern: bifrost            # keys (default): is_bifrost_error -> is_backend_error
+            replacement: backend
+          - pattern: '(?i)bifrost'      # values: string values below paths only, so
+            replacement: backend        # model output is never rewritten
+            target: values
+            paths: [error.message]
+    off: {}
+  defaultRule:
+    variation: enforced
+```
+
+Removals run first, using the names Bifrost writes; renames then run in order. Patterns are Go
+(RE2) regular expressions, and `$1` in a replacement is the first group. Unknown keys or invalid
+patterns make the plugin refuse the whole rule set.
+
+### Configure
+
+```json
+{
+  "enabled": true,
+  "name": "response-blacklist",
+  "path": "https://github.com/ablankt/bifrost-ratelimit-headers/releases/download/response-blacklist-v0.1.0/response-blacklist-linux-amd64-musl.so",
+  "config": {
+    "flag_url": "http://go-feature-flag.go-feature-flag.svc.cluster.local",
+    "rules": { "headers": { "rename": [{ "pattern": "bifrost", "replacement": "backend" }] } }
+  }
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `flag_url` | | Base URL of the GO Feature Flag relay proxy (`env.NAME` reads an environment variable). Without it, only `rules` apply. |
+| `flag_key` | `blacklist-bifrost` | The flag to evaluate. The evaluation context is key `bifrost`, custom `service: bifrost`, so targeting can tell it apart. |
+| `refresh_seconds` | `30` | How often the flag is evaluated. |
+| `timeout_ms` | `2000` | Per-evaluation timeout. |
+| `rules` | | A rule set in the flag's format, applied while the flag serves none. At least one of `flag_url` and `rules` is required. |
+
+The Bifrost log shows which rules are applied (`[response-blacklist] flag blacklist-bifrost rules
+applied: ...`), whenever they change.
+
+### How it reaches each part of a response
+
+* **Headers:** in `HTTPTransportResponseHeadersHook`, right before Bifrost commits them, for normal,
+  streamed and error responses.
+* **Non-streamed bodies:** in `HTTPTransportPostHook`, on the JSON bytes the client receives. Bodies
+  that are not JSON, and bodies without any key a rule names, are left untouched and not
+  re-encoded. Numbers keep their exact digits.
+* **Stream chunks:** in `HTTPTransportStreamChunkHook`, on Bifrost's typed chunk before it is
+  serialized or converted for an integration route. The plugin edits a copy, so Bifrost's own
+  chunk (and with it logging) is untouched, and fields Bifrost keeps out of JSON survive for the
+  converters. Removing a field Bifrost always writes (no `omitempty`, such as
+  `extra_fields.routing_info`) can only empty it; the log reports each such path once. Key renames
+  do not apply to stream chunks.
+
+Out of reach: responses to requests Bifrost's authentication refuses (401s run no plugin hooks),
+CORS preflight (`OPTIONS`) answers, and very large responses Bifrost streams without buffering.
+
+### Tested
+
+The arm64 musl build was tested in a dynamically linked Bifrost v2.3.0, with the rules served by a
+GO Feature Flag v1.55.3 relay proxy from the real `blacklist_bifrost.yaml`, against a fake OpenAI
+upstream that sends `prompt_filter_results` and rate-limit headers:
+
+| Check | Result |
+|---|---|
+| `/v1/chat/completions` and `/openai/v1/chat/completions`, normal and streamed | no header name or value containing `bifrost`; `provider`, `provider_response_headers`, `routing_info.key` and `prompt_filter_results` gone; model output unchanged |
+| Flag switched to `off` | everything above back within ~2s, without a restart |
+| Flag edited | new rules applied within ~2s, without a restart |
+
+Unit tests cover paths through arrays, wildcards and `json.RawMessage` fields, removal of any value
+type, key and value renames, number and HTML preservation, header rules, refused rule sets, that
+stream chunks are copied rather than modified, the flag's served, disabled, missing, invalid and
+unreachable states, and Bifrost's reload order.
 
 ---
 
