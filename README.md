@@ -7,6 +7,7 @@ Custom [Bifrost](https://github.com/maximhq/bifrost) plugins, built for **Bifros
 |---|---|---|
 | [`api-key-mapper`](#api-key-mapper) | Accepts API keys issued for the previous gateway by swapping in the Bifrost virtual key they map to | `api-key-mapper-v0.1.2` |
 | [`response-blacklist`](#response-blacklist) | Removes and renames response headers and JSON body entries (streamed too) so gateway internals do not reach customers, with rules from a GO Feature Flag flag | `response-blacklist-v0.1.0` |
+| [`model-normalizer`](#model-normalizer) | Rewrites the requested model to its canonical spelling (`qWeN3.5-9B` → `Qwen3.5-9B`) so logs and cost attribution match the datasheet | `model-normalizer-v0.1.0` |
 | [`joke-header`](#joke-header) | Smoke test: adds `x-joke-header` to every inference response | `v0.1.0` |
 
 Every release ships four builds. Use the one that matches your Bifrost binary:
@@ -237,6 +238,34 @@ Unit tests cover paths through arrays, wildcards and `json.RawMessage` fields, r
 type, key and value renames, number and HTML preservation, header rules, refused rule sets, that
 stream chunks are copied rather than modified, the flag's served, disabled, missing, invalid and
 unreachable states, and Bifrost's reload order.
+
+---
+
+## model-normalizer
+
+Clients may send a model in any case (`t-systems-dev/qWeN3.5-9B`). The upstream may accept it, but Bifrost then logs that spelling, and cost attribution against a datasheet fails because datasheet keys are case-sensitive (`t-systems-dev/Qwen3.5-9B`). Lowercasing would not help: the key is mixed case. The plugin rewrites the top-level `"model"` of a JSON request body to the canonical name that matches it case-insensitively, in `HTTPTransportPreHook`, before Bifrost parses the request. Routing, logs and pricing then all see one spelling. The rest of the body is not re-encoded.
+
+```json
+{
+  "enabled": true,
+  "name": "model-normalizer",
+  "path": "https://github.com/ablankt/bifrost-ratelimit-headers/releases/download/model-normalizer-v0.1.0/model-normalizer-linux-amd64-musl.so",
+  "config": {
+    "datasheet_url": "http://portal-api.portal-api.svc.cluster.local:8000/v1/datasheet"
+  }
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `datasheet_url` | | A datasheet: a JSON object keyed by `provider/model` (portal-api's `/v1/datasheet`, `https://getbifrost.ai/datasheet`). Its keys are the canonical names. Read at start and every `refresh_seconds`; a failed read keeps the names it had. `env.NAME` reads an environment variable. |
+| `models` | | Extra canonical names, e.g. `["t-systems-dev/Qwen3.5-9B"]`. At least one of `datasheet_url` and `models` is required. |
+| `refresh_seconds` | `300` | Datasheet refresh interval (at least 10). |
+| `timeout_ms` | `5000` | Datasheet request timeout. |
+
+- `provider/model` matches in full. A model sent without a provider prefix matches on the model part when exactly one canonical name has it.
+- Unknown models, bodies that are not JSON (multipart uploads) and models in the URL path (`/genai/...`) are left alone.
+- Tested in a dynamically linked Bifrost 2.3.0: `openai/qWeN3.5-9B` and `OPENAI/qwen3.5-9b` reached the upstream and Bifrost's `original_model_requested` as `Qwen3.5-9B`.
 
 ---
 
