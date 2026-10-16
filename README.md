@@ -7,7 +7,7 @@ Custom [Bifrost](https://github.com/maximhq/bifrost) plugins, built for **Bifros
 |---|---|---|
 | [`api-key-mapper`](#api-key-mapper) | Accepts API keys issued for the previous gateway by swapping in the Bifrost virtual key they map to | `api-key-mapper-v0.1.2` |
 | [`response-blacklist`](#response-blacklist) | Removes and renames response headers and JSON body entries (streamed too) so gateway internals do not reach customers, with rules from a GO Feature Flag flag | `response-blacklist-v0.1.0` |
-| [`model-normalizer`](#model-normalizer) | Rewrites the requested model to its canonical spelling (`qWeN3.5-9B` → `Qwen3.5-9B`) so logs and cost attribution match the datasheet | `model-normalizer-v0.1.0` |
+| [`model-normalizer`](#model-normalizer) | Rewrites the requested model to its canonical spelling (`qWeN3.5-9B` → `Qwen3.5-9B`) so logs and cost attribution match the datasheet | `model-normalizer-v0.1.1` |
 | [`joke-header`](#joke-header) | Smoke test: adds `x-joke-header` to every inference response | `v0.1.0` |
 
 Every release ships four builds. Use the one that matches your Bifrost binary:
@@ -249,7 +249,7 @@ Clients may send a model in any case (`t-systems-dev/qWeN3.5-9B`). The upstream 
 {
   "enabled": true,
   "name": "model-normalizer",
-  "path": "https://github.com/ablankt/bifrost-ratelimit-headers/releases/download/model-normalizer-v0.1.0/model-normalizer-linux-amd64-musl.so",
+  "path": "https://github.com/ablankt/bifrost-ratelimit-headers/releases/download/model-normalizer-v0.1.1/model-normalizer-linux-amd64-musl.so",
   "config": {
     "datasheet_url": "http://portal-api.portal-api.svc.cluster.local:8000/v1/datasheet"
   }
@@ -263,6 +263,7 @@ Clients may send a model in any case (`t-systems-dev/qWeN3.5-9B`). The upstream 
 | `refresh_seconds` | `300` | Datasheet refresh interval (at least 10). |
 | `timeout_ms` | `5000` | Datasheet request timeout. |
 
+- Every response carries `x-normaliser-timing`, the time the plugin spent on the request (e.g. `0.007ms` for a model that needed no change). A value the client sends is overwritten.
 - `provider/model` matches in full. A model sent without a provider prefix matches on the model part when exactly one canonical name has it.
 - Unknown models, bodies that are not JSON (multipart uploads) and models in the URL path (`/genai/...`) are left alone.
 - Tested in a dynamically linked Bifrost 2.3.0: `openai/qWeN3.5-9B` and `OPENAI/qwen3.5-9b` reached the upstream and Bifrost's `original_model_requested` as `Qwen3.5-9B`.

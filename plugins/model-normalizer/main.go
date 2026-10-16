@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,11 @@ import (
 )
 
 const pluginName = "model-normalizer"
+
+// timingHeader reports how long the pre-hook took. The pre-hook stores it as a request
+// header, which the response-headers hook copies to the response: the two hooks see the
+// same request, but not the same BifrostContext.
+const timingHeader = "x-normaliser-timing"
 
 // Version is stamped by build.sh through -ldflags "-X main.Version=...".
 var Version = "dev"
@@ -91,26 +97,62 @@ func Cleanup() error {
 // requested model Bifrost records is already the canonical one.
 func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
 	n := active.Load()
-	if n == nil || req == nil || len(req.Body) == 0 || !isJSON(req) {
+	if n == nil || req == nil {
 		return nil, nil
+	}
+	start := time.Now()
+	normalize(ctx, n, req)
+	if req.Headers != nil {
+		// Always written, so a timing a client sent in the request is overwritten.
+		setHeader(req.Headers, timingHeader, strconv.FormatFloat(float64(time.Since(start).Nanoseconds())/1e6, 'f', 3, 64)+"ms")
+	}
+	return nil, nil
+}
+
+// HTTPTransportResponseHeadersHook adds x-normaliser-timing, the time the pre-hook took,
+// to the response.
+func HTTPTransportResponseHeadersHook(_ *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error {
+	if active.Load() == nil || req == nil || resp == nil {
+		return nil
+	}
+	if timing := req.CaseInsensitiveHeaderLookup(timingHeader); timing != "" {
+		resp.SetHeader(timingHeader, timing)
+	}
+	return nil
+}
+
+func normalize(ctx *schemas.BifrostContext, n *normalizer, req *schemas.HTTPRequest) {
+	if len(req.Body) == 0 || !isJSON(req) {
+		return
 	}
 	model := gjson.GetBytes(req.Body, "model")
 	if model.Type != gjson.String {
-		return nil, nil
+		return
 	}
 	canonical, ok := n.index.Load().canonical(model.Str)
 	if !ok || canonical == model.Str {
-		return nil, nil
+		return
 	}
 	body, err := sjson.SetBytes(req.Body, "model", canonical)
 	if err != nil {
-		return nil, nil
+		return
 	}
 	req.Body = body
 	if ctx != nil {
 		ctx.Log(schemas.LogLevelInfo, fmt.Sprintf("model %q normalized to %q", model.Str, canonical))
 	}
-	return nil, nil
+}
+
+// setHeader writes under the name the header already has, if any: two map entries
+// differing only in case would both be written back, in random order.
+func setHeader(headers map[string]string, name, value string) {
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			headers[k] = value
+			return
+		}
+	}
+	headers[name] = value
 }
 
 // index maps case-folded model names to their canonical spelling. It is immutable once

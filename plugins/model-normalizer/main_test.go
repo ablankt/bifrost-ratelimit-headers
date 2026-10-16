@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -56,6 +58,29 @@ func TestNormalizesToCanonicalSpelling(t *testing.T) {
 		}
 		if in == want && string(req.Body) != before {
 			t.Errorf("%s: body changed although the model was already canonical", in)
+		}
+	}
+}
+
+func TestTimingHeader(t *testing.T) {
+	initWith(t, map[string]any{"models": []any{"t-systems-dev/Qwen3.5-9B"}})
+	for _, req := range []*schemas.HTTPRequest{
+		chat("t-systems-dev/qwen3.5-9b"), // rewritten
+		chat("openai/gpt-4o"),            // untouched: still timed
+	} {
+		req.Headers["X-Normaliser-Timing"] = "spoofed" // a client cannot pre-set it
+		_, _ = HTTPTransportPreHook(nil, req)
+		resp := &schemas.HTTPResponseMetadata{Headers: map[string]string{}}
+		if err := HTTPTransportResponseHeadersHook(nil, req, resp); err != nil {
+			t.Fatal(err)
+		}
+		got := resp.Header(timingHeader)
+		ms, err := strconv.ParseFloat(strings.TrimSuffix(got, "ms"), 64)
+		if !strings.HasSuffix(got, "ms") || err != nil || ms < 0 {
+			t.Fatalf("x-normaliser-timing = %q", got)
+		}
+		if len(req.Headers) != 2 {
+			t.Fatalf("timing written twice under different cases: %v", req.Headers)
 		}
 	}
 }
