@@ -6,7 +6,8 @@
 #   musl  - golang:1.27.0-alpine3.24 (transports/Dockerfile, Makefile DYNAMIC=1, docs "Option A")
 #   glibc - golang:1.27.0-bookworm   (docs "Option B" Debian Dockerfile)
 # go.mod/go.sum are Bifrost transports/v2.3.0's own, so every shared module resolves to the
-# version linked into the host binary.
+# version linked into the host binary. A plugin with its own go.mod targets another Bifrost build:
+# it is built as that module, with the images and targets its build.env sets.
 #
 # Usage: ./build.sh <plugin> [version]   e.g. ./build.sh api-key-mapper v0.1.0
 #        (builds ./plugins/<plugin>; artifacts land in dist/)
@@ -20,6 +21,16 @@ DIST="$ROOT/dist"
 
 MUSL_IMAGE="golang:1.27.0-alpine3.24@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc"
 GLIBC_IMAGE="golang:1.27.0-bookworm@sha256:ded31c68586d2e49e760acc2e65a884b23d032e9bbbed0ae0c55abd3fcaf4452"
+
+WORKDIR=/src
+PKG="./plugins/$NAME"
+if [ -f "$ROOT/plugins/$NAME/go.mod" ]; then
+  WORKDIR="/src/plugins/$NAME"
+  PKG=.
+fi
+if [ -f "$ROOT/plugins/$NAME/build.env" ]; then
+  . "$ROOT/plugins/$NAME/build.env"
+fi
 
 TARGETS=(${TARGETS:-amd64/musl arm64/musl amd64/glibc arm64/glibc})
 
@@ -42,12 +53,12 @@ for target in "${TARGETS[@]}"; do
     -v "$DIST:/dist" \
     -v bifrost-plugin-gomod:/go/pkg/mod \
     -v "bifrost-plugin-gocache-$arch-$libc:/root/.cache/go-build" \
-    -w /src \
+    -w "$WORKDIR" \
     -e CGO_ENABLED=1 -e GOOS=linux -e GOARCH="$arch" -e GOWORK=off -e GOFLAGS=-mod=readonly \
     "$image" \
     sh -c "$deps && go build -buildmode=plugin -trimpath \
              -ldflags='-X main.Version=$VERSION' \
-             -o /dist/$out ./plugins/$NAME && go version -m /dist/$out | head -3"
+             -o /dist/$out $PKG && go version -m /dist/$out | head -3"
 done
 
 (cd "$DIST" && shasum -a 256 ./"$NAME"-*.so | sed 's# \./# #' > "$NAME-SHA256SUMS" && cat "$NAME-SHA256SUMS")

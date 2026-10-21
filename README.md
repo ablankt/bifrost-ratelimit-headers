@@ -8,6 +8,7 @@ Custom [Bifrost](https://github.com/maximhq/bifrost) plugins, built for **Bifros
 | [`api-key-mapper`](#api-key-mapper) | Accepts API keys issued for the previous gateway by swapping in the Bifrost virtual key they map to | `api-key-mapper-v0.1.2` |
 | [`response-blacklist`](#response-blacklist) | Removes and renames response headers and JSON body entries (streamed too) so gateway internals do not reach customers, with rules from a GO Feature Flag flag | `response-blacklist-v0.1.0` |
 | [`model-normalizer`](#model-normalizer) | Rewrites the requested model to its canonical spelling (`qWeN3.5-9B` → `Qwen3.5-9B`) so logs and cost attribution match the datasheet | `model-normalizer-v0.1.1` |
+| [`vk-metadata-headers`](#vk-metadata-headers) | Test, **Enterprise 2.3.2 only**: copies virtual key metadata into the request headers recorded on the trace (Kafka) | `vk-metadata-headers-v0.1.0` |
 | [`joke-header`](#joke-header) | Smoke test: adds `x-joke-header` to every inference response | `v0.1.0` |
 
 Every release ships four builds. Use the one that matches your Bifrost binary:
@@ -267,6 +268,54 @@ Clients may send a model in any case (`t-systems-dev/qWeN3.5-9B`). The upstream 
 - `provider/model` matches in full. A model sent without a provider prefix matches on the model part when exactly one canonical name has it.
 - Unknown models, bodies that are not JSON (multipart uploads) and models in the URL path (`/genai/...`) are left alone.
 - Tested in a dynamically linked Bifrost 2.3.0: `openai/qWeN3.5-9B` and `OPENAI/qwen3.5-9b` reached the upstream and Bifrost's `original_model_requested` as `Qwen3.5-9B`.
+
+---
+
+## vk-metadata-headers
+
+A test of whether a virtual key's CCE identity can travel with the trace. The plugin copies entries
+of the presented key's [metadata](https://docs.getbifrost.ai/features/governance/virtual-keys#metadata-per-key)
+into the request headers Bifrost records on the request's trace, so a trace connector (the Kafka
+plugin's `request_headers`) exports them as if the caller had sent them. The request itself is not
+changed: nothing reaches the provider or the response.
+
+Governance puts the key's metadata on the request context in its `PreRequestHook`. In `PreLLMHook`,
+which runs after every plugin's `PreRequestHook`, the plugin merges the mapped values into the
+request's headers and hands them to the tracer's `SetTraceRequestHeaders`. That setter replaces the
+recorded headers, keeps only the names a connector captures, and redacts credentials. A metadata
+value wins over a header the caller sent under the same name.
+
+```json
+{
+  "name": "vk-metadata-headers",
+  "enabled": true,
+  "path": "https://github.com/ablankt/bifrost-ratelimit-headers/releases/download/vk-metadata-headers-v0.1.0/vk-metadata-headers-linux-amd64-musl.so",
+  "config": {
+    "headers": {
+      "x-cce-key-id": "cce_key_id",
+      "x-cce-project-id": "cce_project_id"
+    }
+  }
+}
+```
+
+| Key | Default | |
+|---|---|---|
+| `headers` | *(required)* | Header name → virtual key metadata key. Names are case-insensitive. A header must also be in the Kafka plugin's `request_headers`, or the tracer drops it. |
+
+To test, give a virtual key metadata such as `cce_key_id: hello-world` and `cce_project_id:
+hello-project` (`PUT /api/governance/virtual-keys/{id}` with `{"metadata": {...}}`, or the key's
+sheet), then send a request with that key directly to Bifrost. The Kafka message then carries
+`"x-cce-key-id": "hello-world"` in `RequestHeaders`, and `PluginLogs` has a `vk-metadata-headers`
+entry: `trace headers set from virtual key metadata: ...`, or why it set nothing.
+
+Unlike the other plugins, this one targets **Bifrost Enterprise 2.3.2** as deployed on
+llm-serving-dev. Its own `go.mod` pins `bifrost/core` v1.13.1 and its `build.env` selects go1.27.3
+on Alpine 3.23, amd64 musl only (`./build.sh vk-metadata-headers v0.1.0`); a v2.3.0 build does not
+load into 2.3.2, nor the other way round. It relies on two internals no plugin API promises: the
+context key `bifrost-governance-virtual-key-metadata` and the tracer's `SetTraceRequestHeaders`. A
+Bifrost upgrade can break either, which then shows only as a `PluginLogs` warning. A key without the
+mapped metadata keeps whatever the caller sent in those headers.
 
 ---
 
